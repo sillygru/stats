@@ -20,6 +20,10 @@ internal class SensorsReader: Reader<Sensors_List> {
     private var lastRead: TimeInterval = ProcessInfo.processInfo.systemUptime
     private let firstRead: TimeInterval = ProcessInfo.processInfo.systemUptime
     private var lastIOSensorsRead: Date? = nil
+    private var cpuEnergyLive: Bool = false
+    private var cpuEnergyAdvancedLastRead: Bool = false
+    private var ramEnergyLive: Bool = false
+    private var ramEnergyAdvancedLastRead: Bool = false
     
     private var HIDState: Bool {
         Store.shared.bool(key: "Sensors_hid", defaultValue: false)
@@ -569,6 +573,36 @@ extension SensorsReader {
         guard elapsed > 0 else { return 0 }
         return (currentEnergy - previousEnergy) / elapsed
     }
+    
+    // SMC power rails matching the IOReport domains. They are read only as a fallback, see below.
+    private static let cpuRails = ["PP0b"]
+    private static let ramRails = ["PP4b", "PP9b"]
+    
+    // The `Energy Model` counters are refreshed asynchronously on some SoCs and are not guaranteed
+    // to advance between two reads. While a counter is not advancing, the per-sample delta is
+    // meaningless (zero, or a spike when a delayed refresh lands), so the current power is read from
+    // the SMC rails instead. The IOReport delta stays in use on machines where the counter advances
+    // on every read.
+    private func cpuPower(_ energyDelta: Double) -> Double {
+        guard !self.cpuEnergyLive else { return energyDelta }
+        return self.smcPower(Self.cpuRails) ?? energyDelta
+    }
+    
+    private func ramPower(_ energyDelta: Double) -> Double {
+        guard !self.ramEnergyLive else { return energyDelta }
+        return self.smcPower(Self.ramRails) ?? energyDelta
+    }
+    
+    private func smcPower(_ rails: [String]) -> Double? {
+        var total = 0.0
+        var found = false
+        for rail in rails {
+            guard let value = SMC.shared.getValue(rail), value.isFinite, value >= 0 else { continue }
+            total += value
+            found = true
+        }
+        return found ? total : nil
+    }
 
     private func IOSensors() -> (Double, Double, Double, Double, Double)? {
         guard let reportSample = IOReportCreateSamples(self.subscription, self.channels, nil)?.takeRetainedValue(),
@@ -613,13 +647,21 @@ extension SensorsReader {
             self.lastIOSensorsRead = now
             return (0, 0, 0, 0, 0)
         }
+        let cpuAdvanced = prevCPU > 0 && self.powers.CPU > prevCPU
+        self.cpuEnergyLive = cpuAdvanced && self.cpuEnergyAdvancedLastRead
+        self.cpuEnergyAdvancedLastRead = cpuAdvanced
+        
+        let ramAdvanced = prevRAM > 0 && self.powers.RAM > prevRAM
+        self.ramEnergyLive = ramAdvanced && self.ramEnergyAdvancedLastRead
+        self.ramEnergyAdvancedLastRead = ramAdvanced
+        
         let elapsed = now.timeIntervalSince(lastIOSensorsRead)
         defer { self.lastIOSensorsRead = now }
         return (
-            Self.appleSiliconPower(currentEnergy: self.powers.CPU, previousEnergy: prevCPU, elapsed: elapsed),
+            self.cpuPower(Self.appleSiliconPower(currentEnergy: self.powers.CPU, previousEnergy: prevCPU, elapsed: elapsed)),
             Self.appleSiliconPower(currentEnergy: self.powers.GPU, previousEnergy: prevGPU, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.ANE, previousEnergy: prevANE, elapsed: elapsed),
-            Self.appleSiliconPower(currentEnergy: self.powers.RAM, previousEnergy: prevRAM, elapsed: elapsed),
+            self.ramPower(Self.appleSiliconPower(currentEnergy: self.powers.RAM, previousEnergy: prevRAM, elapsed: elapsed)),
             Self.appleSiliconPower(currentEnergy: self.powers.PCI, previousEnergy: prevPCI, elapsed: elapsed)
         )
     }
